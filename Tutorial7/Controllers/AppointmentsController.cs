@@ -95,4 +95,69 @@ public class AppointmentsController : ControllerBase
         };
         return Ok(dto);
     }
+    [HttpPost]
+    public async Task<IActionResult> Add([FromBody] CreateAppointmentRequestDto request)
+    {
+        if (request.AppointmentDate <= DateTime.Now)
+            return BadRequest(new ErrorResponseDto { Message = "Appointment date can not be in the past." });
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+        var check = await IsPatientAndDoctorAvailableAsync(connection, request.IdPatient, request.IdDoctor);
+        if (check != null) return BadRequest(new ErrorResponseDto { Message = check });
+        if (await IsThereScheduleConflictAsync(connection, request.IdDoctor, request.AppointmentDate))
+            return Conflict(new ErrorResponseDto { Message = "Doctor has already an appointment at this time." });
+        var sql = @"
+            INSERT INTO dbo.Appointments (IdPatient, IdDoctor, AppointmentDate, Status, Reason)
+            OUTPUT INSERTED.IdAppointment
+            VALUES (@IdPatient, @IdDoctor, @AppointmentDate, N'Scheduled', @Reason);";
+        await using var command = new SqlCommand(sql, connection);
+        command.Parameters.Add("@IdPatient", SqlDbType.Int).Value = request.IdPatient;
+        command.Parameters.Add("@IdDoctor", SqlDbType.Int).Value = request.IdDoctor;
+        command.Parameters.Add("@AppointmentDate", SqlDbType.DateTime2).Value = request.AppointmentDate;
+        command.Parameters.Add("@Reason", SqlDbType.NVarChar, 250).Value = request.Reason;
+        var insertedId = (int)await command.ExecuteScalarAsync()!;
+        return Created($"/api/appointments/{insertedId}", new { IdAppointment = insertedId });
+    }
+    private async Task<string?> IsPatientAndDoctorAvailableAsync(SqlConnection connection, int idPatient, int idDoctor)
+    {
+        var sql = @"
+            SELECT 'Patient' AS Type, IsActive FROM dbo.Patients WHERE IdPatient = @IdPatient
+            UNION ALL
+            SELECT 'Doctor' AS Type, IsActive FROM dbo.Doctors WHERE IdDoctor = @IdDoctor;";
+        await using var command = new SqlCommand(sql, connection);
+        command.Parameters.Add("@IdPatient", SqlDbType.Int).Value = idPatient;
+        command.Parameters.Add("@IdDoctor", SqlDbType.Int).Value = idDoctor;
+        await using var reader = await command.ExecuteReaderAsync();
+        bool patientFound = false, doctorFound = false, patientActive = false, doctorActive = false;
+        while (await reader.ReadAsync())
+        {
+            var type = reader.GetString(reader.GetOrdinal("Type"));
+            var isActive = reader.GetBoolean(reader.GetOrdinal("IsActive"));
+            if (type == "Patient") { patientFound = true; patientActive = isActive; }
+            if (type == "Doctor") { doctorFound = true; doctorActive = isActive; }
+        }
+        if (!patientFound) return "Patient not found.";
+        if (!patientActive) return "Patient not active.";
+        if (!doctorFound) return "Doctor not found.";
+        if (!doctorActive) return "Doctor not active.";
+        return null;
+    }
+    private async Task<bool> IsThereScheduleConflictAsync(SqlConnection connection, int idDoctor, DateTime appointmentDate, int? excludeAppointmentId = null)
+    {
+        var sql = @"
+            SELECT COUNT(1) 
+            FROM dbo.Appointments 
+            WHERE IdDoctor = @IdDoctor 
+              AND AppointmentDate = @AppointmentDate 
+              AND Status != N'Cancelled'";
+        if (excludeAppointmentId.HasValue)
+            sql += " AND IdAppointment != @ExcludeId";
+        await using var command = new SqlCommand(sql, connection);
+        command.Parameters.Add("@IdDoctor", SqlDbType.Int).Value = idDoctor;
+        command.Parameters.Add("@AppointmentDate", SqlDbType.DateTime2).Value = appointmentDate;
+        if (excludeAppointmentId.HasValue)
+            command.Parameters.Add("@ExcludeId", SqlDbType.Int).Value = excludeAppointmentId.Value;
+        var count = (int)(await command.ExecuteScalarAsync())!;
+        return count > 0;
+    }
 }
