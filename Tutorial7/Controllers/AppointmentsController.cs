@@ -118,6 +118,50 @@ public class AppointmentsController : ControllerBase
         var insertedId = (int)await command.ExecuteScalarAsync()!;
         return Created($"/api/appointments/{insertedId}", new { IdAppointment = insertedId });
     }
+    [HttpPut("{idAppointment}")]
+    public async Task<IActionResult> Update(int idAppointment, [FromBody] UpdateAppointmentRequestDto request)
+    {
+        var statusOptions = new[] { "Scheduled", "Completed", "Cancelled" };
+        if (!statusOptions.Contains(request.Status))
+            return BadRequest(new ErrorResponseDto { Message = "Invalid status." });
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+        var sql = "SELECT Status, AppointmentDate FROM dbo.Appointments WHERE IdAppointment = @Id";
+        await using var command = new SqlCommand(sql, connection);
+        command.Parameters.Add("@Id", SqlDbType.Int).Value = idAppointment;
+        await using var reader = await command.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+            return NotFound(new ErrorResponseDto { Message = "Appointment not found." });
+        var status = reader.GetString(reader.GetOrdinal("Status"));
+        var date = reader.GetDateTime(reader.GetOrdinal("AppointmentDate"));
+        await reader.CloseAsync();
+        if (status == "Completed" && date != request.AppointmentDate)
+            return Conflict(new ErrorResponseDto { Message = "Completed appointment's date cannot be changed." });
+        var check = await IsPatientAndDoctorAvailableAsync(connection, request.IdPatient, request.IdDoctor);
+        if (check != null) return BadRequest(new ErrorResponseDto { Message = check });
+        if (await IsThereScheduleConflictAsync(connection, request.IdDoctor, request.AppointmentDate, idAppointment))
+            return Conflict(new ErrorResponseDto { Message = "Doctor has already an appointment at this time." });
+        var updateSql = @"
+            UPDATE dbo.Appointments
+            SET IdPatient = @IdPatient,
+                IdDoctor = @IdDoctor,
+                AppointmentDate = @AppointmentDate,
+                Status = @Status,
+                Reason = @Reason,
+                InternalNotes = @InternalNotes
+            WHERE IdAppointment = @IdAppointment;";
+        await using var updateCommand = new SqlCommand(updateSql, connection);
+        updateCommand.Parameters.Add("@IdAppointment", SqlDbType.Int).Value = idAppointment;
+        updateCommand.Parameters.Add("@IdPatient", SqlDbType.Int).Value = request.IdPatient;
+        updateCommand.Parameters.Add("@IdDoctor", SqlDbType.Int).Value = request.IdDoctor;
+        updateCommand.Parameters.Add("@AppointmentDate", SqlDbType.DateTime2).Value = request.AppointmentDate;
+        updateCommand.Parameters.Add("@Status", SqlDbType.NVarChar, 30).Value = request.Status;
+        updateCommand.Parameters.Add("@Reason", SqlDbType.NVarChar, 250).Value = request.Reason;
+        updateCommand.Parameters.Add("@InternalNotes", SqlDbType.NVarChar, 500).Value =
+            request.InternalNotes ?? (object)DBNull.Value;
+        await updateCommand.ExecuteNonQueryAsync();
+        return Ok();
+    }
     private async Task<string?> IsPatientAndDoctorAvailableAsync(SqlConnection connection, int idPatient, int idDoctor)
     {
         var sql = @"
